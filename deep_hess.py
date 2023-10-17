@@ -38,7 +38,25 @@ def main(images: list, lr: float, max_steps: int, optim: str, reg: float = 0.0, 
     def compare_psnr(img1, img2):
         MSE = np.mean(np.abs(img1-img2)**2)
         psnr=10*np.log10(np.max(np.abs(img1))**2/MSE)
-        return psnr    
+        return psnr 
+
+    # def compute_svd(conv_layer):
+    #     weights = conv_layer.weight.data
+    #     if len(weights.shape) == 4:  # Convolutional layers have 4-dimensional weights
+    #         weights = weights.view(weights.size(0), -1)
+    #     _, s, _ = torch.svd(weights)
+    #     return s   
+    
+    def compute_and_save_svd(model, iteration, singular_values_lists):
+        for i, module in enumerate(model.modules()):
+            if isinstance(module, torch.nn.Conv2d):
+                # Compute SVD
+                _, s, _ = torch.svd(module.weight.data.view(module.weight.data.shape[0], -1))
+                #print(s.shape,module.weight.data.shape)
+                # Save SVD results
+                singular_values_lists[iteration//show_every][i].append(s.detach().cpu().numpy())
+
+
     
     img_np_list=[]
     img_noisy_np_list=[]
@@ -67,7 +85,7 @@ def main(images: list, lr: float, max_steps: int, optim: str, reg: float = 0.0, 
             img_np = pil_to_np(img_pil)
             img_np = img_np[0, :, :]
 
-            img_noisy_np = img_np + sigma*np.random.normal(scale=sigma, size=img_np.shape)
+            img_noisy_np = img_np +np.random.normal(scale=sigma, size=img_np.shape)
             img_noisy_np = np.clip(img_noisy_np , 0, 1).astype(np.float32)
 
             img_np_list.append(img_np)
@@ -83,6 +101,7 @@ def main(images: list, lr: float, max_steps: int, optim: str, reg: float = 0.0, 
     print(f"Noisy PSNR is '{compare_psnr(img_np,img_noisy_np)}'")
 
             
+
     # Modify input and output depths
     input_depth = 3    
     output_depth = 1
@@ -96,26 +115,26 @@ def main(images: list, lr: float, max_steps: int, optim: str, reg: float = 0.0, 
     INPUT = "noise"
         
     net_input_list = [get_noise(input_depth, INPUT, img_np.shape[0:]).type(dtype) for img_np in img_np_list]
-    net = skip(
-        input_depth, output_depth,
-        num_channels_down = [16, 32, 64, 128, 128, 128][:num_layers],
-        num_channels_up   = [16, 32, 64, 128, 128, 128][:num_layers],
-        num_channels_skip = [0]*num_layers,
-        upsample_mode='nearest',
-        downsample_mode='avg',
-        need1x1_up = False,
-        filter_size_down=5, 
-        filter_size_up=3,
-        filter_skip_size = 1,
-        need_sigmoid=True, 
-        need_bias=True, 
-        pad='reflection', 
-        act_fun='LeakyReLU').type(dtype)
+    # net = skip(
+    #     input_depth, output_depth,
+    #     num_channels_down = [16, 32, 64, 128, 128, 128][:num_layers],
+    #     num_channels_up   = [16, 32, 64, 128, 128, 128][:num_layers],
+    #     num_channels_skip = [0]*num_layers,
+    #     upsample_mode='nearest',
+    #     downsample_mode='avg',
+    #     need1x1_up = False,
+    #     filter_size_down=5, 
+    #     filter_size_up=3,
+    #     filter_skip_size = 1,
+    #     need_sigmoid=True, 
+    #     need_bias=True, 
+    #     pad='reflection', 
+    #     act_fun='LeakyReLU').type(dtype)
 
-    #net = cnn( num_input_channels=input_depth, num_output_channels=output_depth,
-    #    num_layers=10,
-    #    need_bias=True, pad='zero',
-    #    act_fun='LeakyReLU').type(dtype)
+    net = cnn( num_input_channels=input_depth, num_output_channels=output_depth,
+       num_layers=3,
+       need_bias=True, pad='zero',
+       act_fun='LeakyReLU').type(dtype)
    
     
     print(f"Starting optimization with optimizer '{optim}'")
@@ -133,8 +152,13 @@ def main(images: list, lr: float, max_steps: int, optim: str, reg: float = 0.0, 
     grad_list = []
     sharp=[]
     psnr_lists = [[] for _ in range(len(img_np_list))]
+    global singular_values_lists
+    #singular_values_lists = [[[] for _ in range(num_layers + 1)] for _ in range(int(max_steps/show_every) +1)]  # +1 for the final_conv layer
+    singular_values_lists = [[[] for _ in range(len(list(net.modules())))] for _ in range(max_steps // show_every + 1)]
+    
 
-    def closure_sgd(j,net_input,img_var,noise_var,m):
+    def closure_sgd(j,net_input,img_var,noise_var,m,singular_values_lists):
+        
 
         img_var = np_to_torch(img_var).type(dtype)
         noise_var = np_to_torch(noise_var).type(dtype)
@@ -154,10 +178,23 @@ def main(images: list, lr: float, max_steps: int, optim: str, reg: float = 0.0, 
             optimizer.second_step(zero_grad=True)
 
         with torch.no_grad():
-            grads= 0
             #mask_com = torch.logical_not(mask_var).cpu().detach()
-            loss = mse(out.detach().cpu(), img_var.detach().cpu())
+            if j % show_every == 0:
+                # for i in range(num_layers):
+                #     conv_layer = net._modules[f"conv_{i+1}"]
+                #     singular_values = compute_svd(conv_layer)
+                #     singular_values_lists[j//show_every][i].append(singular_values.cpu().numpy())
+                compute_and_save_svd(net, j, singular_values_lists)
 
+                # for i, module in enumerate(net.modules()):
+                #     if isinstance(module, torch.nn.Conv2d):
+                #         singular_values = compute_svd(module)
+                #         singular_values_lists[j//show_every][i].append(singular_values.detach().cpu().numpy())
+    
+
+                # final_conv_layer = net._modules["final_conv"]
+                # singular_values_final = compute_svd(final_conv_layer)
+                # singular_values_lists[j//show_every][num_layers].append(singular_values_final.cpu().numpy())
 
                 #np_plot(out.detach().cpu().numpy()[0], 'Iter: %d; gt %.2f' % (i, psrn_gt))
                 #plt.imshow(out[0,0,:,:].detach().cpu().numpy(),cmap="gray")
@@ -171,12 +208,6 @@ def main(images: list, lr: float, max_steps: int, optim: str, reg: float = 0.0, 
             out_np = out.detach().cpu().numpy()[0]
             img_np = img_var.detach().cpu().numpy()
             psnr_gt  = compare_psnr(img_np, out_np)
-
-            #print(compare_psnr(img_np,noise_var.detach().cpu().numpy()))
-
-            
-
-
             psnr_lists[m].append(psnr_gt)
 
 
@@ -186,25 +217,28 @@ def main(images: list, lr: float, max_steps: int, optim: str, reg: float = 0.0, 
     for j in range(max_steps):
         #optimizer.zero_grad()
         for m in range(len(img_np_list)):
-            psnr = closure_sgd(j, net_input_list[m], img_np_list[m], img_noisy_np_list[m], m)
+            #psnr = closure_sgd(j, net_input_list[m], img_np_list[m], img_noisy_np_list[m], m)
+            psnr = closure_sgd(j, net_input_list[m], img_np_list[m], img_noisy_np_list[m], m, singular_values_lists)
 
 
         if j%show_every==0 and j!=0:
             #print(psnr_lists[0][-1],psnr_lists[1][-1],psnr_lists[-1][-1]) 
             #print(psnr_lists[0][-1])   
-            e1,e2= get_hessian_eigenvalues(net, ind_loss, net_input_list, img_np_list, img_noisy_np_list,neigs=2)
+            #e1,e2= get_hessian_eigenvalues(net, ind_loss, net_input_list, img_np_list, img_noisy_np_list,neigs=2)
             #jac = get_jac_norm(net,net_input_list)
             #trace = get_trace(net, ind_loss, net_input_list, img_np_list, img_noisy_np_list)
             #print(e1,jac,trace)
-            print(f"At step '{j}', e1 is '{e1}', psnr is '{psnr}'")
-            sharp.append(e1)
+            #print(e1,jac,trace)
+            #print(f"At step '{j}', e1 is '{e1}', psnr is '{psnr}'")
+
+            print(f"At step '{j}', psnr is '{psnr}'")
+            #sharp.append(e1)
             #jacl.append(jac)
             #tr.append(trace)     
         #if j%10000==0:
             #eig,weight = get_hessian_spectrum(net, ind_loss, net_input_list, img_np_list, img_noisy_np_list,iter= 100, n_v=1)
 
 
-    psnr = psnr_list_0.copy()
 
     #for i, image in enumerate(images):
     #    np.savez(f"result/inpainting/{image}_{lr}_{reg}_{sigma}.npz", sharp, psnr)

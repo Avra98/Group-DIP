@@ -26,7 +26,7 @@ from sam import SAM
 
 import argparse
 
-def main(images: list, lr: float, max_steps: int, optim: str, reg: float = 0.0, sigma: float = 0.2, num_layers: int = 4, show_every: int=1000, device_id: int = 0,beta: float = 0.0,ino : int =0):
+def main(images: list, lr: float, max_steps: int, optim: str, reg: float = 0.0, sigma: float = 0.2, num_layers: int = 4, show_every: int=1000, device_id: int = 0,beta: float = 0.0,ino : int =0, training_size: int = 20):
 
     torch.cuda.set_device(device_id)
     torch.cuda.current_device() 
@@ -43,13 +43,19 @@ def main(images: list, lr: float, max_steps: int, optim: str, reg: float = 0.0, 
     
     img_np_list=[]
     img_noisy_np_list=[]
-    train_folder = 'result/Urban100/image_SRF_2/test'
+    noisy_psnr_list=[]
+    train_folder = 'result/Urban100/image_SRF_2/train'
     train_noisy_folder = 'result/Urban100/image_SRF_2/train_noisy_{}'.format(sigma)
 
+    # os.system(f"rm -rf {train_noisy_folder}/") 
     os.makedirs(train_noisy_folder, exist_ok=True)
 
     print(sigma)
     for i, file_path in enumerate(glob.glob(os.path.join(train_folder, '*.png'))):
+
+        # train on 20 images
+        if i == args.training_size:
+            break
 
         filename = os.path.splitext(os.path.basename(file_path))[0]
         imsize = -1
@@ -59,14 +65,16 @@ def main(images: list, lr: float, max_steps: int, optim: str, reg: float = 0.0, 
 
         img_noisy_np = img_np + np.random.normal(scale=sigma, size=img_np.shape)
         img_noisy_np = np.clip(img_noisy_np , 0, 1).astype(np.float32)
-        print(np.max(img_np), np.min(img_np))
         img_np_list.append(img_np)
         img_noisy_np_list.append(img_noisy_np)
-        print(f"Noisy PSNR is '{compare_psnr(img_np,img_noisy_np)}'")
+
+        noisy_psnr = compare_psnr(img_np,img_noisy_np)
+        noisy_psnr_list.append(noisy_psnr)
+        print(f"Noisy PSNR for image {i} is '{noisy_psnr}': (max, min)=({np.max(img_np), np.min(img_np)}))")
         img_noisy_pil = np_to_pil(img_noisy_np)
         img_noisy_pil.save(os.path.join(train_noisy_folder, filename + '.png'))
             
-    print(len(img_noisy_np_list))
+    print(f'Training on {len(img_noisy_np_list)} images; sigma is {sigma}; showing every {show_every} steps')
    
             
     # Modify input and output depths
@@ -115,11 +123,14 @@ def main(images: list, lr: float, max_steps: int, optim: str, reg: float = 0.0, 
     psnr_lists = [[] for _ in range(len(img_np_list))]
 
     def closure_sgd(j,net_input,img_var,noise_var,m):
-
+        ## Clean image
         img_var = np_to_torch(img_var).type(dtype)
+        ## Noisy image
         noise_var = np_to_torch(noise_var).type(dtype)
 
+        ## network pass
         out = net(net_input)
+        ## compute loss of network op vs noisy image 
         total_loss = mse(out, noise_var)
 
         if optim=="SGD" or  optim=="ADAM":      
@@ -144,6 +155,7 @@ def main(images: list, lr: float, max_steps: int, optim: str, reg: float = 0.0, 
         return psnr_gt,out_np[0,:,:]
 
             
+    os.makedirs('result/Urban100/out_images', exist_ok=True)
     for j in range(max_steps):
         for m in range(len(img_np_list)):
             psnr,out = closure_sgd(j, net_input_list[m], img_np_list[m], img_noisy_np_list[m], m)
@@ -151,7 +163,6 @@ def main(images: list, lr: float, max_steps: int, optim: str, reg: float = 0.0, 
                 print(f"At step '{j}', for image '{m}', psnr is '{psnr}'")  
 
                 out = (out - out.min()) / (out.max() - out.min())   
-                os.makedirs('result/Urban100/out_images', exist_ok=True)
                 plt.imsave(f'result/Urban100/out_images/out_image_{m}_{j}.png', out, cmap='gray')
 
         if j % show_every == 0 and j != 0:
@@ -168,11 +179,15 @@ def main(images: list, lr: float, max_steps: int, optim: str, reg: float = 0.0, 
     now = datetime.now()
     date_time = now.strftime("%Y-%m-%d_%H-%M-%S")
 
-    torch.save(net.state_dict(), f'model_optim-{args.optim}_sigma-{args.sigma}_{date_time}.pth')
-    print(f"Model saved as model_optim-{args.optim}_sigma-{args.sigma}_{date_time}.pth")
+    model_dir = 'groupdip_models'
+    os.makedirs(model_dir, exist_ok=True)
+    torch.save(net.state_dict(), f'{model_dir}/model_optim-{args.optim}_sigma-{args.sigma}_{date_time}.pth')
+    print(f"Model saved as model_optim{args.optim}_sigma{args.sigma}_lr{args.lr}_{date_time}.pth")
 
 
     def plot_psnr(psnr_lists):
+        filedir = f"result/Urban100/psnr_images_{args.optim}_sigma{args.sigma}_lr{args.lr}/"
+        os.makedirs(filedir)
         for i, psnr_list in enumerate(psnr_lists):
             plt.figure(figsize=(10, 5))
             plt.plot(psnr_list)
@@ -180,7 +195,8 @@ def main(images: list, lr: float, max_steps: int, optim: str, reg: float = 0.0, 
             plt.xlabel("Iteration")
             plt.ylabel("PSNR")
             plt.grid(True)
-            plt.savefig(f"result/Urban100/psnr_images/psnr_image_{i}.png") 
+            plt.axhline(y=noisy_psnr_list[i])
+            plt.savefig(f"{filedir}/psnr_image_{i}.png") 
 
     plot_psnr(psnr_lists)
             
@@ -189,16 +205,27 @@ if __name__ == "__main__":
     
     parser.add_argument("--images", type=str, default = ["Lena512rgb"], help="which image to denoise")
     parser.add_argument("--lr", type=float,  default=0.08, help="the learning rate")
-    parser.add_argument("--max_steps", type=int, default=3000, help="the maximum number of gradient steps to train for")
-    parser.add_argument("--optim", type=str, default="SGD", help="which optimizer")
+    parser.add_argument("--max_steps", type=int, default=20000, help="the maximum number of gradient steps to train for")
+    parser.add_argument("--optim", type=str, default="SAM", help="which optimizer")
     #parser.add_argument("--IGR", type=str, default="Normal", help="true if SAM ")
     parser.add_argument("--reg", type=float, default=0.05, help="if regularization strength of igr")
-    parser.add_argument("--sigma", type=float, default=0.2, help="noise-level")
+    parser.add_argument("--sigma", type=float, default=0.05, help="noise-level")
     parser.add_argument("--num_layers", type=int, default=6, help="number of layers")
-    parser.add_argument("--show_every", type=int, default=1000, help="show_every")
+    parser.add_argument("--show_every", type=int, default=100, help="show_every")
     parser.add_argument("--device_id", type=int, default=0, help="specify which gpu")
     parser.add_argument("--beta", type=float, default=0, help="momentum for sgd ")
     parser.add_argument("--ino", type=int, default=0, help="image index ")
+    parser.add_argument("--training_size", type=int, default=20, help="how many images to train on")
     args = parser.parse_args()
     
-    main(images=args.images, lr=args.lr, max_steps=args.max_steps, optim= args.optim,reg=args.reg,sigma = args.sigma, num_layers = args.num_layers, show_every = args.show_every, beta = args.beta, device_id = args.device_id,ino = args.ino)
+    main(images=args.images, 
+         lr=args.lr, 
+         max_steps=args.max_steps, 
+         optim= args.optim,
+         reg=args.reg,sigma = args.sigma,
+         num_layers = args.num_layers, 
+         show_every = args.show_every,
+         beta = args.beta, 
+         device_id = args.device_id,
+         ino = args.ino,
+         training_size = args.training_size)
